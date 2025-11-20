@@ -21,19 +21,7 @@
       "!dist/**"
     ],
     "win": {
-      "target": [
-        {
-          "target": "nsis",
-          "arch": ["x64"]
-        }
-      ],
-      "icon": "assets/icon.ico"
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
+      "target": "dir"
     }
   },
   "keywords": [
@@ -46,6 +34,7 @@
   "license": "MIT",
   "dependencies": {
     "archiver": "^7.0.1",
+    "archiver-utils": "^5.0.2",
     "ejs": "^3.1.10",
     "express": "^4.19.2",
     "ffmpeg-static": "^5.2.0",
