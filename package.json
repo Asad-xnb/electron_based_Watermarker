@@ -24,8 +24,18 @@
       "node_modules/ffprobe-static/**/*"
     ],
     "win": {
-      "target": "dir",
+      "target": [
+        "dir",
+        "nsis"
+      ],
       "sign": null
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
     }
   },
   "keywords": [
