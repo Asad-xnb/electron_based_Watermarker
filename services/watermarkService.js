@@ -1,63 +1,56 @@
 const sharp = require('sharp');
-const ffmpegPath = require('ffmpeg-static');
-const ffprobePath = require('ffprobe-static').path;
+const ffmpegStaticPath = require('ffmpeg-static');
+const ffprobeStaticPath = require('ffprobe-static').path;
 const { spawn } = require('child_process');
 const archiver = require('archiver');
+const path = require('path');
+const os = require('os');
 const fs = require('fs').promises;
 const fsSync = require('fs');
-const path = require('path');
 
-const processingStatus = new Map();
+const resolveBinaryPath = (binaryPath) => {
+  if (!binaryPath) return binaryPath;
+  return binaryPath.replace('app.asar', 'app.asar.unpacked');
+};
 
-async function processFiles(uploadId, watermarkPath, files, options) {
-  const outputDir = path.join(__dirname, '..', 'output', uploadId);
-  await fs.mkdir(outputDir, { recursive: true });
+const ffmpegPath = resolveBinaryPath(ffmpegStaticPath);
+const ffprobePath = resolveBinaryPath(ffprobeStaticPath);
 
-  processingStatus.set(uploadId, {
-    total: files.length,
-    processed: 0,
-    completed: false,
-    errors: []
-  });
-
-  const watermarkBuffer = await fs.readFile(watermarkPath);
+async function processFilesInMemory(watermarkBuffer, files, options) {
+  const processedFiles = [];
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
     const ext = path.extname(file.originalname).toLowerCase();
-    const outputPath = path.join(outputDir, file.originalname);
 
     try {
+      let processedBuffer;
+      
       if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) {
-        await processImage(file.path, watermarkBuffer, outputPath, options);
+        processedBuffer = await processImage(file.buffer, watermarkBuffer, options);
       } else if (['.mp4', '.mov', '.avi', '.mkv', '.webm'].includes(ext)) {
-        await processVideo(file.path, watermarkPath, outputPath, options);
+        // Videos need temp files for ffmpeg
+        processedBuffer = await processVideo(file.buffer, watermarkBuffer, file.originalname, options);
       } else {
         throw new Error(`Unsupported file format: ${ext}`);
       }
 
-      processingStatus.get(uploadId).processed++;
-    } catch (error) {
-      processingStatus.get(uploadId).errors.push({
-        file: file.originalname,
-        error: error.message
+      processedFiles.push({
+        name: file.originalname,
+        buffer: processedBuffer
       });
-      processingStatus.get(uploadId).processed++;
+    } catch (error) {
+      // Skip failed files
+      continue;
     }
   }
 
-  // Create ZIP file
-  const zipPath = path.join(__dirname, '..', 'output', `${uploadId}.zip`);
-  await createZip(outputDir, zipPath);
-
-  processingStatus.get(uploadId).completed = true;
-
-  // Clean up source files
-  await cleanupUpload(uploadId);
+  // Create ZIP in memory
+  return await createZipInMemory(processedFiles);
 }
 
-async function processImage(inputPath, watermarkBuffer, outputPath, options) {
-  const image = sharp(inputPath);
+async function processImage(inputBuffer, watermarkBuffer, options) {
+  const image = sharp(inputBuffer);
   const metadata = await image.metadata();
 
   // Resize watermark based on scale
@@ -91,17 +84,27 @@ async function processImage(inputPath, watermarkBuffer, outputPath, options) {
     }])
     .toBuffer();
 
-  await image
+  return await image
     .composite([{
       input: watermarkWithOpacity,
       top: position.top,
       left: position.left
     }])
-    .toFile(outputPath);
+    .toBuffer();
 }
 
-async function processVideo(inputPath, watermarkPath, outputPath, options) {
-  return new Promise((resolve, reject) => {
+async function processVideo(inputBuffer, watermarkBuffer, filename, options) {
+  // For video processing, we need temporary files as ffmpeg doesn't support stdin/stdout for complex operations
+  const tmpDir = os.tmpdir();
+  const inputPath = path.join(tmpDir, `input_${Date.now()}_${filename}`);
+  const watermarkPath = path.join(tmpDir, `wm_${Date.now()}.png`);
+  const outputPath = path.join(tmpDir, `output_${Date.now()}_${filename}`);
+
+  try {
+    // Write temp files
+    await fs.writeFile(inputPath, inputBuffer);
+    await fs.writeFile(watermarkPath, watermarkBuffer);
+
     // Get video dimensions first using ffprobe
     const ffprobeArgs = [
       '-v', 'error',
@@ -111,66 +114,79 @@ async function processVideo(inputPath, watermarkPath, outputPath, options) {
       inputPath
     ];
 
-    const ffprobe = spawn(ffprobePath, ffprobeArgs);
-    let probeData = '';
+    const probeData = await new Promise((resolve, reject) => {
+      const ffprobe = spawn(ffprobePath, ffprobeArgs);
+      let data = '';
 
-    ffprobe.stdout.on('data', (data) => {
-      probeData += data.toString();
+      ffprobe.stdout.on('data', (chunk) => {
+        data += chunk.toString();
+      });
+
+      ffprobe.on('close', (code) => {
+        if (code === 0) resolve(data);
+        else reject(new Error('Failed to probe video'));
+      });
+
+      ffprobe.on('error', reject);
     });
 
-    ffprobe.on('close', (code) => {
-      if (code !== 0) {
-        return reject(new Error('Failed to probe video'));
-      }
+    const metadata = JSON.parse(probeData);
+    const stream = metadata.streams[0];
+    if (!stream) throw new Error('No video stream found');
 
-      try {
-        const metadata = JSON.parse(probeData);
-        const stream = metadata.streams[0];
-        if (!stream) return reject(new Error('No video stream found'));
+    const width = stream.width;
+    const height = stream.height;
 
-        const width = stream.width;
-        const height = stream.height;
+    // Calculate watermark position for video
+    const position = getVideoPosition(width, height, options.position, options.scale);
 
-        // Calculate watermark position for video
-        const position = getVideoPosition(width, height, options.position, options.scale);
+    // Process video with ffmpeg
+    const ffmpegArgs = [
+      '-i', inputPath,
+      '-i', watermarkPath,
+      '-filter_complex',
+      `[1:v]scale=${Math.round(width * options.scale)}:-1[wm];[wm]format=rgba,colorchannelmixer=aa=${options.opacity}[wm_opacity];[0:v][wm_opacity]overlay=${position}[outv]`,
+      '-map', '[outv]',
+      '-map', '0:a?',
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-c:a', 'copy',
+      '-y',
+      outputPath
+    ];
 
-        // Process video with ffmpeg
-        const ffmpegArgs = [
-          '-i', inputPath,
-          '-i', watermarkPath,
-          '-filter_complex',
-          `[1:v]scale=${Math.round(width * options.scale)}:-1[wm];[wm]format=rgba,colorchannelmixer=aa=${options.opacity}[wm_opacity];[0:v][wm_opacity]overlay=${position}[outv]`,
-          '-map', '[outv]',
-          '-map', '0:a?',
-          '-c:v', 'libx264',
-          '-preset', 'fast',
-          '-c:a', 'copy',
-          '-y',
-          outputPath
-        ];
+    await new Promise((resolve, reject) => {
+      const ffmpegProcess = spawn(ffmpegPath, ffmpegArgs);
 
-        const ffmpegProcess = spawn(ffmpegPath, ffmpegArgs);
+      ffmpegProcess.on('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`FFmpeg exited with code ${code}`));
+      });
 
-        ffmpegProcess.on('close', (code) => {
-          if (code === 0) {
-            resolve();
-          } else {
-            reject(new Error(`FFmpeg exited with code ${code}`));
-          }
-        });
-
-        ffmpegProcess.on('error', (err) => {
-          reject(err);
-        });
-      } catch (err) {
-        reject(err);
-      }
+      ffmpegProcess.on('error', reject);
     });
 
-    ffprobe.on('error', (err) => {
-      reject(err);
-    });
-  });
+    // Read the output file
+    const outputBuffer = await fs.readFile(outputPath);
+
+    // Clean up temp files
+    await Promise.all([
+      fs.unlink(inputPath).catch(() => {}),
+      fs.unlink(watermarkPath).catch(() => {}),
+      fs.unlink(outputPath).catch(() => {})
+    ]);
+
+    return outputBuffer;
+  } catch (error) {
+    // Clean up on error
+    await Promise.all([
+      fs.unlink(inputPath).catch(() => {}),
+      fs.unlink(watermarkPath).catch(() => {}),
+      fs.unlink(outputPath).catch(() => {})
+    ]);
+    throw error;
+  }
+
 }
 
 function calculatePosition(imgWidth, imgHeight, wmWidth, wmHeight, position) {
@@ -199,8 +215,6 @@ function calculatePosition(imgWidth, imgHeight, wmWidth, wmHeight, position) {
 
 function getVideoPosition(width, height, position, scale) {
   const padding = 20;
-  const wmWidth = Math.round(width * scale);
-  const wmHeight = Math.round(height * scale);
 
   const positions = {
     'top-left': `${padding}:${padding}`,
@@ -215,67 +229,34 @@ function getVideoPosition(width, height, position, scale) {
   return positions[position] || positions['bottom-right'];
 }
 
-async function createZip(sourceDir, outputPath) {
+async function createZipInMemory(processedFiles) {
   return new Promise((resolve, reject) => {
-    const output = fsSync.createWriteStream(outputPath);
+    const buffers = [];
     const archive = archiver('zip', {
       zlib: { level: 9 }
     });
 
-    output.on('close', () => resolve());
-    archive.on('error', (err) => reject(err));
+    archive.on('data', (chunk) => {
+      buffers.push(chunk);
+    });
 
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
+    archive.on('end', () => {
+      resolve(Buffer.concat(buffers));
+    });
+
+    archive.on('error', (err) => {
+      reject(err);
+    });
+
+    // Add files to archive
+    processedFiles.forEach(file => {
+      archive.append(file.buffer, { name: file.name });
+    });
+
     archive.finalize();
   });
 }
 
-async function cleanupUpload(uploadId) {
-  const uploadDir = path.join(__dirname, '..', 'uploads', uploadId);
-  const outputDir = path.join(__dirname, '..', 'output', uploadId);
-
-  // Add longer delay to allow all file handles to close on Windows
-  await new Promise(resolve => setTimeout(resolve, 3000));
-
-  // Retry cleanup with exponential backoff
-  const cleanup = async (dir, retries = 3) => {
-    for (let i = 0; i < retries; i++) {
-      try {
-        await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 500 });
-        return;
-      } catch (error) {
-        if (i < retries - 1) {
-          await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
-        }
-      }
-    }
-  };
-
-  await cleanup(uploadDir);
-  await cleanup(outputDir);
-}
-
-async function cleanup(uploadId) {
-  const zipPath = path.join(__dirname, '..', 'output', `${uploadId}.zip`);
-  try {
-    await fs.unlink(zipPath);
-    processingStatus.delete(uploadId);
-  } catch (error) {
-    console.error('Cleanup error:', error);
-  }
-}
-
-function getStatus(uploadId) {
-  const status = processingStatus.get(uploadId);
-  if (!status) {
-    return { error: 'Upload not found' };
-  }
-  return status;
-}
-
 module.exports = {
-  processFiles,
-  getStatus,
-  cleanup
+  processFilesInMemory
 };

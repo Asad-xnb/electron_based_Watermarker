@@ -1,27 +1,14 @@
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs').promises;
-const { v4: uuidv4 } = require('uuid');
 const watermarkService = require('./services/watermarkService');
 
 const app = express();
 let serverInstance = null;
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: async (req, file, cb) => {
-    const uploadDir = path.join(__dirname, 'uploads', req.uploadId);
-    await fs.mkdir(uploadDir, { recursive: true });
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    cb(null, file.originalname);
-  }
-});
-
+// Configure multer for file uploads (memory storage)
 const upload = multer({
-  storage: storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 500 * 1024 * 1024 }, // 500MB limit
   fileFilter: (req, file, cb) => {
     const allowedMimes = [
@@ -43,13 +30,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
-// Add upload ID to request
-app.use((req, res, next) => {
-  if (req.method === 'POST' && req.path === '/upload') {
-    req.uploadId = uuidv4();
-  }
-  next();
-});
+
 
 // Routes
 app.get('/', (req, res) => {
@@ -65,9 +46,8 @@ app.post('/upload', upload.fields([
       return res.status(400).json({ error: 'Please provide both watermark and files to process' });
     }
 
-    const watermarkPath = req.files.watermark[0].path;
+    const watermarkBuffer = req.files.watermark[0].buffer;
     const filesToProcess = req.files.files;
-    const uploadId = req.uploadId;
     
     const options = {
       position: req.body.position || 'bottom-right',
@@ -75,61 +55,40 @@ app.post('/upload', upload.fields([
       scale: parseFloat(req.body.scale) || 0.2
     };
 
-    // Process files in background
-    watermarkService.processFiles(uploadId, watermarkPath, filesToProcess, options)
-      .catch(err => {});
+    // Process files and get ZIP buffer
+    const zipBuffer = await watermarkService.processFilesInMemory(watermarkBuffer, filesToProcess, options);
 
-    res.json({ 
-      success: true, 
-      uploadId: uploadId,
-      message: 'Processing started'
-    });
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', 'attachment; filename="watermarked-files.zip"');
+    res.send(zipBuffer);
   } catch (error) {
-    res.status(500).json({ error: 'Failed to process files' });
+    res.status(500).json({ error: 'Failed to process files: ' + error.message });
   }
 });
 
-app.get('/status/:uploadId', async (req, res) => {
-  try {
-    const status = await watermarkService.getStatus(req.params.uploadId);
-    res.json(status);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to get status' });
-  }
-});
 
-app.get('/download/:uploadId', async (req, res) => {
-  try {
-    const zipPath = path.join(__dirname, 'output', `${req.params.uploadId}.zip`);
-    
-    // Check if file exists
-    await fs.access(zipPath);
-    
-    res.download(zipPath, 'watermarked-files.zip', async (err) => {
-      // Clean up after download
-      setTimeout(async () => {
-        try {
-          await watermarkService.cleanup(req.params.uploadId);
-        } catch (e) {}
-      }, 5000);
-    });
-  } catch (error) {
-    res.status(404).json({ error: 'File not found' });
-  }
-});
 
 // Start server
-function start(port) {
-  return new Promise((resolve) => {
-    serverInstance = app.listen(port, () => {
-      resolve();
-    });
+function start(preferredPort = 0) {
+  return new Promise((resolve, reject) => {
+    serverInstance = app
+      .listen(preferredPort, () => {
+        const addressInfo = serverInstance.address();
+        const resolvedPort = addressInfo && addressInfo.port ? addressInfo.port : preferredPort;
+        console.log(`[server] running on port ${resolvedPort}`);
+        resolve(resolvedPort);
+      })
+      .on('error', (err) => {
+        console.error('[server] failed to start', err);
+        reject(err);
+      });
   });
 }
 
 // Stop server
 function stop() {
   if (serverInstance) {
+    console.log('[server] shutting down');
     serverInstance.close();
   }
 }

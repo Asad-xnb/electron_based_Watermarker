@@ -132,15 +132,11 @@
           <svg class="mx-auto h-16 w-16 text-green-500 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
           </svg>
-          <h3 class="text-2xl font-bold text-green-800 mb-2">Processing Complete!</h3>
-          <p class="text-gray-600 mb-4">Your watermarked files are ready</p>
-          <button id="downloadBtn" 
-                  class="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-8 rounded-lg shadow-lg transform transition hover:scale-105">
-            Download ZIP File
-          </button>
+          <h3 class="text-2xl font-bold text-green-800 mb-2">Download Complete!</h3>
+          <p class="text-gray-600 mb-4">Your watermarked files have been downloaded</p>
           <button id="resetBtn" 
-                  class="ml-4 bg-gray-600 hover:bg-gray-700 text-white font-bold py-3 px-8 rounded-lg shadow-lg transform transition hover:scale-105">
-            Start New
+                  class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-8 rounded-lg shadow-lg transform transition hover:scale-105">
+            Process More Files
           </button>
         </div>
       </div>
@@ -153,9 +149,6 @@
   </div>
 
   <script>
-    let currentUploadId = null;
-    let statusInterval = null;
-
     // Watermark dropzone
     const watermarkDropzone = document.getElementById('watermarkDropzone');
     const watermarkInput = document.getElementById('watermarkInput');
@@ -227,60 +220,44 @@
       progressSection.classList.remove('hidden');
       downloadSection.classList.add('hidden');
       
+      document.getElementById('progressText').textContent = 'Processing files, please wait...';
+      document.getElementById('progressBar').style.width = '50%';
+      
       try {
         const response = await fetch('/upload', {
           method: 'POST',
           body: formData
         });
         
-        const result = await response.json();
-        
-        if (result.success) {
-          currentUploadId = result.uploadId;
-          checkStatus();
-        } else {
-          throw new Error(result.error || 'Upload failed');
+        if (!response.ok) {
+          const error = await response.json();
+          throw new Error(error.error || 'Upload failed');
         }
+        
+        // Get the ZIP file as blob
+        const blob = await response.blob();
+        
+        // Create download link
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'watermarked-files.zip';
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+        
+        // Show success
+        progressSection.classList.add('hidden');
+        downloadSection.classList.remove('hidden');
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Apply Watermark';
       } catch (error) {
         alert('Error: ' + error.message);
         submitBtn.disabled = false;
         submitBtn.textContent = 'Apply Watermark';
         progressSection.classList.add('hidden');
       }
-    });
-
-    function checkStatus() {
-      statusInterval = setInterval(async () => {
-        try {
-          const response = await fetch(`/status/${currentUploadId}`);
-          const status = await response.json();
-          
-          const progressBar = document.getElementById('progressBar');
-          const progressText = document.getElementById('progressText');
-          
-          const percentage = Math.round((status.processed / status.total) * 100);
-          progressBar.style.width = percentage + '%';
-          progressText.textContent = `${status.processed} of ${status.total} files processed`;
-          
-          if (status.completed) {
-            clearInterval(statusInterval);
-            showDownload();
-          }
-        } catch (error) {
-          console.error('Status check error:', error);
-        }
-      }, 1000);
-    }
-
-    function showDownload() {
-      document.getElementById('progressSection').classList.add('hidden');
-      document.getElementById('downloadSection').classList.remove('hidden');
-      document.getElementById('submitBtn').disabled = false;
-      document.getElementById('submitBtn').textContent = 'Apply Watermark';
-    }
-
-    document.getElementById('downloadBtn').addEventListener('click', () => {
-      window.location.href = `/download/${currentUploadId}`;
     });
 
     document.getElementById('resetBtn').addEventListener('click', () => {
